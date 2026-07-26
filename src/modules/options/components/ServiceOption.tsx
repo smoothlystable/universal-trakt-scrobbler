@@ -53,7 +53,7 @@ export const ServiceOption = ({ serviceId, initialValue }: ServiceOptionProps): 
 			sync={value.sync}
 			autoSync={value.autoSync}
 			autoSyncDays={value.autoSyncDays}
-			lastSync={value.lastSync}
+			lastSync={value.lastSyncAttempt ?? value.lastSync}
 			handleChange={handleChange}
 		/>
 	);

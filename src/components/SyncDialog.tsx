@@ -1,3 +1,4 @@
+import { getServiceApi } from '@apis/ServiceApi';
 import { TraktSync } from '@apis/TraktSync';
 import { SyncDialogShowData } from '@common/Events';
 import { I18N } from '@common/I18N';
@@ -48,17 +49,30 @@ export const SyncDialog = (): JSX.Element => {
 			try {
 				await TraktSync.sync(store, items);
 				if (serviceId) {
-					const lastSync = items[0].watchedAt ?? Utils.unix();
-					if (lastSync > Shared.storage.options.services[serviceId].lastSync) {
-						await Shared.storage.saveOptions({
-							services: {
-								[serviceId]: {
-									lastSync,
-									lastSyncId: items[0].id,
-								},
-							},
-						});
+					const serviceValue = Shared.storage.options.services[serviceId];
+					const checkpoint = getServiceApi(serviceId).getPendingHistoryCheckpoint(
+						store.data.items,
+						serviceValue.lastSync,
+						serviceValue.lastSyncId,
+						Shared.storage.syncOptions.minPercentageWatched
+					);
+					const partialServiceValue = {
+						lastSyncAttempt: Utils.unix(),
+						lastSync: checkpoint.lastSync,
+						lastSyncId: checkpoint.lastSyncId,
+					};
+					if (!checkpoint.hasPendingItems) {
+						const lastSync = items[0].watchedAt ?? Utils.unix();
+						if (lastSync > serviceValue.lastSync) {
+							partialServiceValue.lastSync = lastSync;
+							partialServiceValue.lastSyncId = items[0].id;
+						}
 					}
+					await Shared.storage.saveOptions({
+						services: {
+							[serviceId]: partialServiceValue,
+						},
+					});
 				} else {
 					await Shared.storage.remove('syncCache');
 					await store.resetData();

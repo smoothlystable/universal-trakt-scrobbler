@@ -167,6 +167,7 @@ class _TraktSync extends TraktApi {
 				await store.update(newItems, true);
 				await Shared.events.dispatch('HISTORY_SYNC_ERROR', null, { error: err });
 			}
+			throw err;
 		}
 	}
 }

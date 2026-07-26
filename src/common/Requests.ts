@@ -1,6 +1,6 @@
 import { Messaging } from '@common/Messaging';
 import { RequestError } from '@common/RequestError';
-import { RequestsManager } from '@common/RequestsManager';
+import { RateLimitPermit, RequestRateLimit, RequestsManager } from '@common/RequestsManager';
 import { Shared } from '@common/Shared';
 import browser from 'webextension-polyfill';
 
@@ -11,6 +11,7 @@ export type RequestDetails = {
 	body?: unknown;
 	signal?: AbortSignal;
 	cancelKey?: string;
+	rateLimit?: RequestRateLimit;
 	withHeaders?: Record<string, string>;
 };
 
@@ -61,8 +62,16 @@ class _Requests {
 	): Promise<void> {
 		let responseStatus = 0;
 		let responseText = '';
+		let rateLimitPermit: RateLimitPermit | undefined;
 		try {
-			const response = await this.fetch(request, tabId);
+			request.signal ??= RequestsManager.getAbortSignal(tabId, request.cancelKey);
+			if (request.rateLimit) {
+				rateLimitPermit = await RequestsManager.acquireRateLimit(request.rateLimit, request.signal);
+			}
+
+			const options = await this.getOptions(request, tabId);
+			rateLimitPermit?.markStarted();
+			const response = await this.fetch(request, tabId, options);
 			responseStatus = response.status;
 			responseText = await response.text();
 
@@ -106,9 +115,10 @@ class _Requests {
 			}
 
 			if (responseStatus === 429) {
-				const retryAfterStr = response.headers.get('Retry-After');
-				if (retryAfterStr) {
-					const retryAfter = Number.parseInt(retryAfterStr) * 1000;
+				const retryAfter =
+					this.parseRetryAfter(response.headers.get('Retry-After')) ??
+					(request.rateLimit ? 60000 : undefined);
+				if (typeof retryAfter !== 'undefined') {
 					if (
 						this.scheduleRateLimitRetry(
 							request,
@@ -167,8 +177,26 @@ class _Requests {
 				})
 			);
 			return;
+		} finally {
+			rateLimitPermit?.release();
 		}
 		resolve(responseText);
+	}
+
+	private parseRetryAfter(value: string | null): number | undefined {
+		if (!value) {
+			return;
+		}
+
+		const seconds = Number(value);
+		if (Number.isFinite(seconds) && seconds >= 0) {
+			return seconds * 1000;
+		}
+
+		const date = Date.parse(value);
+		if (Number.isFinite(date)) {
+			return Math.max(0, date - Date.now());
+		}
 	}
 
 	/**
@@ -197,6 +225,10 @@ class _Requests {
 			return true;
 		}
 
+		if (request.rateLimit) {
+			RequestsManager.pauseRateLimit(request.rateLimit.key, retryAfter);
+		}
+
 		if (rateLimitAttempt >= this.MAX_RATE_LIMIT_RETRIES) {
 			console.warn(
 				`[UTS] ${reason} for ${request.url}: giving up after ${rateLimitAttempt} retries`
@@ -207,7 +239,21 @@ class _Requests {
 		console.warn(
 			`[UTS] ${reason} for ${request.url}: retrying in ${retryAfter / 1000}s (attempt ${rateLimitAttempt + 1}/${this.MAX_RATE_LIMIT_RETRIES})`
 		);
-		setTimeout(() => {
+		let timeout: ReturnType<typeof setTimeout>;
+		const onAbort = () => {
+			clearTimeout(timeout);
+			request.signal?.removeEventListener('abort', onAbort);
+			reject(
+				new RequestError({
+					request,
+					status: 429,
+					isCanceled: true,
+				})
+			);
+		};
+		request.signal?.addEventListener('abort', onAbort, { once: true });
+		timeout = setTimeout(() => {
+			request.signal?.removeEventListener('abort', onAbort);
 			// Re-check the abort signal: the request may have been canceled while waiting for the
 			// backoff timer, and `fetch()` would otherwise create a new `AbortController` for it,
 			// effectively "uncanceling" the retry.
@@ -226,14 +272,13 @@ class _Requests {
 		return true;
 	}
 
-	async fetch(request: RequestDetails, tabId = Shared.tabId): Promise<Response> {
-		const options = await this.getOptions(request, tabId);
-
-		const cancelKey = `${tabId !== null ? `${tabId}_` : ''}${request.cancelKey || 'default'}`;
-		if (!RequestsManager.abortControllers.has(cancelKey)) {
-			RequestsManager.abortControllers.set(cancelKey, new AbortController());
-		}
-		request.signal = RequestsManager.abortControllers.get(cancelKey)?.signal;
+	async fetch(
+		request: RequestDetails,
+		tabId = Shared.tabId,
+		options?: RequestOptions
+	): Promise<Response> {
+		options ??= await this.getOptions(request, tabId);
+		request.signal ??= RequestsManager.getAbortSignal(tabId, request.cancelKey);
 
 		return fetch(request.url, {
 			method: options.method,

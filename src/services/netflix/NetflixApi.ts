@@ -6,6 +6,7 @@ import {
 	NetflixPlaybackMetadata,
 } from '@/netflix/NetflixProgress';
 import { ServiceApi, ServiceApiSession } from '@apis/ServiceApi';
+import { RequestError } from '@common/RequestError';
 import { Requests } from '@common/Requests';
 import { ScriptInjector } from '@common/ScriptInjector';
 import { Shared } from '@common/Shared';
@@ -186,12 +187,18 @@ export interface NetflixAuiHistoryResponse {
 	};
 }
 
+const NETFLIX_METADATA_RATE_LIMIT = {
+	key: 'netflix-member-metadata',
+	minIntervalMs: 500,
+};
+
 class _NetflixApi extends ServiceApi {
 	HOST_URL: string;
 	API_URL: string;
 	ACTIVATE_URL: string;
 	isActivated: boolean;
 	session: NetflixSession | null = null;
+	override readonly preservePendingHistoryItems = true;
 	private metadataUrlTemplate: string | null = null;
 	private metadataCache = new Map<string, NetflixSingleMetadataItem | null>();
 
@@ -309,6 +316,9 @@ class _NetflixApi extends ServiceApi {
 					break;
 				}
 			} catch (err) {
+				if (err instanceof RequestError && err.isCanceled) {
+					throw err;
+				}
 				if (attempt === maxRetries) {
 					throw err;
 				}
@@ -331,8 +341,8 @@ class _NetflixApi extends ServiceApi {
 		return historyItem.movieID.toString();
 	}
 
-	prepareHistoryItems(historyItems: NetflixHistoryItem[]) {
-		return this.getHistoryMetadata(historyItems);
+	prepareHistoryItems(historyItems: NetflixHistoryItem[], cancelKey = 'default') {
+		return this.getHistoryMetadata(historyItems, cancelKey);
 	}
 
 	convertHistoryItems(historyItems: NetflixHistoryItemWithMetadata[]) {
@@ -363,14 +373,14 @@ class _NetflixApi extends ServiceApi {
 		return baseUrls;
 	}
 
-	async getHistoryMetadata(historyItems: NetflixHistoryItem[]) {
+	async getHistoryMetadata(historyItems: NetflixHistoryItem[], cancelKey = 'default') {
 		if (!this.session) {
 			throw new Error('Invalid session');
 		}
 		// Netflix removed the bulk `pathEvaluator` endpoint (the routes return
 		// 502/412/421/404 now), so the metadata is fetched through single metadata
 		// requests, one per unique show/movie.
-		return this.getHistoryMetadataFromSingleRequests(historyItems);
+		return this.getHistoryMetadataFromSingleRequests(historyItems, cancelKey);
 	}
 
 	/**
@@ -380,7 +390,8 @@ class _NetflixApi extends ServiceApi {
 	 * is enough to combine the history items with their metadata.
 	 */
 	private async getHistoryMetadataFromSingleRequests(
-		historyItems: NetflixHistoryItem[]
+		historyItems: NetflixHistoryItem[],
+		cancelKey: string
 	): Promise<NetflixHistoryItemWithMetadata[]> {
 		const ids = new Set<number>();
 		for (const historyItem of historyItems) {
@@ -389,8 +400,18 @@ class _NetflixApi extends ServiceApi {
 
 		const metadataById = new Map<number, NetflixSingleMetadataItem | null>();
 		let failures = 0;
+		let requestFailure: Error | null = null;
 		for (const id of ids) {
-			const metadata = await this.getSingleMetadata(id.toString());
+			let metadata: NetflixSingleMetadataItem | null;
+			try {
+				metadata = await this.getSingleMetadata(id.toString(), cancelKey);
+			} catch (err) {
+				if (err instanceof RequestError && err.isCanceled) {
+					throw err;
+				}
+				requestFailure = err instanceof Error ? err : new Error('Metadata request failed');
+				break;
+			}
 			metadataById.set(id, metadata);
 			if (!metadata && !this.metadataUrlTemplate) {
 				failures += 1;
@@ -455,46 +476,113 @@ class _NetflixApi extends ServiceApi {
 			// history can still be loaded and matched on Trakt by title, so don't fail
 			Shared.errors.warning(
 				'Failed to get metadata for some Netflix history items.',
-				new Error('Metadata requests failed')
+				requestFailure ?? new Error('Metadata requests failed')
 			);
 		}
 
 		return historyItemsWithMetadata;
 	}
 
-	private async getSingleMetadata(id: string): Promise<NetflixSingleMetadataItem | null> {
+	private async getSingleMetadata(
+		id: string,
+		cancelKey = 'default'
+	): Promise<NetflixSingleMetadataItem | null> {
 		if (!this.metadataCache.has(id)) {
-			this.metadataCache.set(id, await this.fetchSingleMetadata(id));
+			this.metadataCache.set(id, await this.fetchSingleMetadata(id, cancelKey));
 		}
 		return this.metadataCache.get(id) ?? null;
 	}
 
-	private async fetchSingleMetadata(id: string): Promise<NetflixSingleMetadataItem | null> {
-		const templates = this.getApiBaseUrls().flatMap((baseUrl) => [
-			`${baseUrl}/metadata?languages=en-US&movieid={id}`,
-			`${baseUrl}/metadata?languages=en-US&movieid={id}&authURL=${encodeURIComponent(this.session?.authUrl ?? '')}`,
-		]);
-		if (this.metadataUrlTemplate) {
-			templates.unshift(this.metadataUrlTemplate);
-		}
+	private async fetchSingleMetadata(
+		id: string,
+		cancelKey = 'default'
+	): Promise<NetflixSingleMetadataItem | null> {
+		const preferredTemplate = this.metadataUrlTemplate;
+		const authUrl = encodeURIComponent(this.session?.authUrl ?? '');
+		const preferredTemplates = preferredTemplate
+			? [
+					preferredTemplate,
+					...(preferredTemplate.includes('&authURL=')
+						? []
+						: [`${preferredTemplate}&authURL=${authUrl}`]),
+				]
+			: [];
+		const templates = [
+			...preferredTemplates,
+			...this.getApiBaseUrls().flatMap((baseUrl) => [
+				`${baseUrl}/metadata?languages=en-US&movieid={id}`,
+				`${baseUrl}/metadata?languages=en-US&movieid={id}&authURL=${authUrl}`,
+			]),
+		];
 
-		for (const template of templates) {
+		const uniqueTemplates = [...new Set(templates)];
+		for (const [index, template] of uniqueTemplates.entries()) {
 			try {
 				const responseText = await Requests.send({
 					url: template.replace('{id}', id),
 					method: 'GET',
+					cancelKey,
+					rateLimit: NETFLIX_METADATA_RATE_LIMIT,
 				});
-				const metadata = JSON.parse(responseText) as NetflixSingleMetadataItem;
-				if (metadata?.video) {
+				const metadata = JSON.parse(responseText) as Partial<NetflixSingleMetadataItem> | null;
+				if (metadata && typeof metadata === 'object' && 'video' in metadata) {
 					this.metadataUrlTemplate = template;
-					return metadata;
+					return metadata.video ? (metadata as NetflixSingleMetadataItem) : null;
 				}
-			} catch (_err) {
-				// Try the next URL variation
+			} catch (err) {
+				if (
+					!this.shouldTryNextMetadataTemplate(
+						err,
+						template,
+						uniqueTemplates[index + 1],
+						template === preferredTemplate
+					)
+				) {
+					throw err;
+				}
+				if (template === preferredTemplate) {
+					this.metadataUrlTemplate = null;
+				}
 			}
 		}
 
+		if (preferredTemplate && this.metadataUrlTemplate === preferredTemplate) {
+			this.metadataUrlTemplate = null;
+		}
 		return null;
+	}
+
+	private shouldTryNextMetadataTemplate(
+		err: unknown,
+		template: string,
+		nextTemplate: string | undefined,
+		isPreferred: boolean
+	): boolean {
+		if (!(err instanceof RequestError)) {
+			return true;
+		}
+		if (err.isCanceled) {
+			return false;
+		}
+		if ([400, 404, 412, 421, 502].includes(err.status ?? -1)) {
+			return true;
+		}
+		if (![401, 403].includes(err.status ?? -1)) {
+			return false;
+		}
+		if (err.status === 403 && err.text?.includes('Cloudflare')) {
+			return false;
+		}
+		if (isPreferred) {
+			return true;
+		}
+
+		const authUrl = encodeURIComponent(this.session?.authUrl ?? '');
+		return (
+			!!nextTemplate &&
+			!template.includes('&authURL=') &&
+			nextTemplate === `${template}&authURL=${authUrl}`
+		);
 	}
 
 	isShow(

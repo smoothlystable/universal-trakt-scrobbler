@@ -34,6 +34,7 @@ const _ServiceLastSyncOption = ({
 						[service.id]: {
 							lastSync: 0,
 							lastSyncId: '',
+							lastSyncAttempt: 0,
 						},
 					},
 				});

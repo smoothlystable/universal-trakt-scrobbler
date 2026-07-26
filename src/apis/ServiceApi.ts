@@ -25,6 +25,12 @@ export interface ServiceApiSession {
 	profileName: string | null;
 }
 
+export interface PendingHistoryCheckpoint {
+	hasPendingItems: boolean;
+	lastSync: number;
+	lastSyncId: string;
+}
+
 export abstract class ServiceApi {
 	readonly id: string;
 	private leftoverHistoryItems: unknown[] = [];
@@ -33,11 +39,63 @@ export abstract class ServiceApi {
 	nextHistoryPage = 0;
 	nextHistoryUrl = '';
 	session?: ServiceApiSession | null;
+	readonly preservePendingHistoryItems: boolean = false;
 
 	constructor(id: string) {
 		this.id = id;
 
 		registerServiceApi(this.id, this);
+	}
+
+	getPendingHistoryCheckpoint(
+		items: ScrobbleItem[],
+		currentLastSync: number,
+		currentLastSyncId: string,
+		minPercentageWatched: number
+	): PendingHistoryCheckpoint {
+		if (!this.preservePendingHistoryItems) {
+			return {
+				hasPendingItems: false,
+				lastSync: currentLastSync,
+				lastSyncId: currentLastSyncId,
+			};
+		}
+
+		let oldestPendingItem: ScrobbleItem | null = null;
+		let hasPendingItems = false;
+		let hasUndatedPendingItems = false;
+		for (const item of items) {
+			if (item.progress >= minPercentageWatched) {
+				continue;
+			}
+			hasPendingItems = true;
+			if (typeof item.watchedAt !== 'number' || item.watchedAt <= 0) {
+				hasUndatedPendingItems = true;
+			} else if (!oldestPendingItem || item.watchedAt < (oldestPendingItem.watchedAt ?? Infinity)) {
+				oldestPendingItem = item;
+			}
+		}
+
+		if (hasUndatedPendingItems) {
+			return {
+				hasPendingItems,
+				lastSync: 0,
+				lastSyncId: '',
+			};
+		}
+		const pendingLastSync = Math.max(0, (oldestPendingItem?.watchedAt ?? 0) - 1);
+		if (oldestPendingItem) {
+			return {
+				hasPendingItems,
+				lastSync: pendingLastSync,
+				lastSyncId: oldestPendingItem.id,
+			};
+		}
+		return {
+			hasPendingItems,
+			lastSync: currentLastSync,
+			lastSyncId: currentLastSyncId,
+		};
 	}
 
 	static async loadTraktHistory(
@@ -220,9 +278,19 @@ export abstract class ServiceApi {
 					hasReachedLastSyncDate;
 			} while (!hasReachedEnd && itemsToLoad > 0);
 			if (historyItems.length > 0) {
-				const preparedHistoryItems = await this.prepareHistoryItems(historyItems);
-				if (preparedHistoryItems.length !== historyItems.length) {
-					throw new Error('prepareHistoryItems() must preserve the number of history items');
+				let preparedHistoryItems: unknown[];
+				try {
+					preparedHistoryItems = await this.prepareHistoryItems(historyItems, cancelKey);
+					if (preparedHistoryItems.length !== historyItems.length) {
+						throw new Error('prepareHistoryItems() must preserve the number of history items');
+					}
+				} catch (err) {
+					// Loading has already advanced pagination and split off leftovers. Put this batch
+					// back so a canceled or failed enrichment cannot make the next load skip it.
+					this.leftoverHistoryItems = [...historyItems, ...this.leftoverHistoryItems];
+					caches.history.set(this.id, historyCache);
+					await Cache.set({ history: caches.history });
+					throw err;
 				}
 				const tmpItems: (ScrobbleItem | null)[] = [];
 				const historyItemsToConvert = [];
@@ -326,7 +394,7 @@ export abstract class ServiceApi {
 	 * Enriches history items before cached items and new items take separate paths.
 	 * Implementations must preserve the number and order of the supplied items.
 	 */
-	prepareHistoryItems(historyItems: unknown[]): Promisable<unknown[]> {
+	prepareHistoryItems(historyItems: unknown[], _cancelKey = 'default'): Promisable<unknown[]> {
 		return historyItems;
 	}
 

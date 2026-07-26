@@ -138,6 +138,7 @@ export type ServiceValue = {
 	autoSyncDays: number;
 	lastSync: number;
 	lastSyncId: string;
+	lastSyncAttempt?: number;
 };
 
 export type ThemeValue = 'light' | 'dark' | 'system';
